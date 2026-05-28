@@ -6,9 +6,8 @@ import uuid
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional
-
-from pymax import MaxClient, Message
-from pymax.filters import Filters
+import pymax
+from pymax import WebClient, Message, ExtraConfig
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
 
@@ -28,6 +27,31 @@ LOCAL_HOST = "127.0.0.1"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("IOTClient")
+print(pymax.__version__)
+
+# Monkeypatch LoginResponse and AuthService in pymax to make 'token' field optional
+# and automatically carry over the current session token if the server response lacks one.
+try:
+    from pymax.types.domain.login import LoginResponse
+    from pymax.api.auth.service import AuthService
+    from typing import Optional
+
+    token_field = LoginResponse.model_fields.get("token")
+    if token_field:
+        token_field.default = None
+        token_field.annotation = Optional[str]
+        LoginResponse.__annotations__["token"] = Optional[str]
+        LoginResponse.model_rebuild(force=True)
+
+    original_login = AuthService.login
+    async def patched_login(self, *args, **kwargs):
+        response = await original_login(self, *args, **kwargs)
+        if response and response.token is None and self.app.session is not None:
+            response.token = self.app.session.token
+        return response
+    AuthService.login = patched_login
+except Exception as e:
+    logger.warning(f"Failed to patch pymax Login: {e}")
 
 class UDPLocalProtocol(asyncio.DatagramProtocol):
     def __init__(self, callback):
@@ -35,6 +59,9 @@ class UDPLocalProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, addr):
         asyncio.create_task(self.callback(data, addr))
+
+def filter_chat(chat_id: int):
+    return lambda message: message.chat_id == chat_id
 
 class IOTClient:
     def __init__(self, phone: str, work_dir: str):
@@ -44,9 +71,10 @@ class IOTClient:
         self._identity_file = self._work_dir / "identity.json"
         self._session_db = self._work_dir / "session.db"
         
+        self._stop_event = asyncio.Event()
+
         # Check if this is the first start of the PROTOCOL
         # We consider it NOT the first start if session.db exists
-        # Important: check this BEFORE initializing MaxClient because it touches the file
         if self._session_db.exists():
             self.is_first_start = False
             logger.info("session.db found, assuming not first start.")
@@ -54,10 +82,10 @@ class IOTClient:
             self.is_first_start = True
             logger.info("session.db not found, assuming first start.")
 
-        self.client = MaxClient(
-            phone=phone,
+        self.client = WebClient(
+            session_name="session.db",
             work_dir=work_dir,
-            reconnect=False # We handle reconnect ourselves
+            extra_config=ExtraConfig(reconnect=False)
         )
 
         if self._load_identity():
@@ -82,7 +110,11 @@ class IOTClient:
         self.my_uuid_b64 = base64.b64encode(self.my_uuid.encode()).decode()
         
         # Register handlers
-        self.client.on_message(Filters.chat(CHAT_ID))(self.handle_max_message)
+        self.client.on_message(filter_chat(CHAT_ID))(self.handle_max_message)
+
+    @property
+    def is_connected(self) -> bool:
+        return hasattr(self.client, "_connection") and self.client._connection._is_open
 
     def _load_identity(self) -> bool:
         if self._identity_file.exists():
@@ -142,12 +174,12 @@ class IOTClient:
             recipient = data.get("recipient")
             
             if msg_type == "start":
-                new_key = data.get("pub_key")
+                new_key = data.get("pub_key", data.get("pubkey"))
                 if self.known_uuids.get(author) != new_key:
                     self.known_uuids[author] = new_key
                     self._save_uuids()
                     logger.info(f"Learned and saved new UUID: {author}")
-            elif msg_type == "repeat_start":
+            elif msg_type in ["repeat_start", "repeatstart"]:
                 if recipient == self.my_uuid_b64 or recipient == "broadcast":
                     await self.send_start_message()
             elif author not in self.known_uuids and author != self.my_uuid_b64:
@@ -155,7 +187,7 @@ class IOTClient:
                 return
 
             # Handle content
-            if msg_type in ["content", "content_part"]:
+            if msg_type in ["content", "content_part", "contentpart"]:
                 if recipient == "broadcast" or recipient == self.my_uuid_b64:
                     content = data.get("content")
                     if recipient != "broadcast":
@@ -202,6 +234,28 @@ class IOTClient:
         )
         return base64.b64encode(encrypted).decode()
 
+    async def send_message(self, chat_id: int, text: str) -> Optional[Message]:
+        """Sends a message bypassing the markdown formatter to preserve underscores and technical chars."""
+        from pymax.protocol import Opcode
+        from pymax.api.response import require_payload_model
+        from pymax.types.domain import Message
+        from pymax.api.messages.payloads import SendMessagePayload, SendMessagePayloadMessage
+        
+        cid = self.client._app.api.messages._next_cid()
+        frame = SendMessagePayload(
+            chat_id=chat_id,
+            message=SendMessagePayloadMessage(
+                text=text,
+                cid=cid,
+                elements=[],
+                attaches=[],
+            ),
+            notify=True
+        )
+        response = await self.client._app.invoke(Opcode.MSG_SEND, frame.to_payload())
+        message = require_payload_model(response, Message).bind(self.client._app.api.messages)
+        return message
+
     async def send_start_message(self):
         msg = {
             "protocol": PROTOCOL_NAME,
@@ -210,7 +264,7 @@ class IOTClient:
             "recipient": "broadcast",
             "pub_key": self.pub_key_pem
         }
-        await self.client.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
+        await self.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
 
     async def request_repeat_start(self, target_uuid_b64: str):
         msg = {
@@ -219,7 +273,7 @@ class IOTClient:
             "author": self.my_uuid_b64,
             "recipient": target_uuid_b64
         }
-        await self.client.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
+        await self.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
 
     async def send_to_local_port(self, content: str):
         try:
@@ -240,7 +294,7 @@ class IOTClient:
                     logger.info("Attempting to connect...")
                     await self.client.start()
                     # If start() returns cleanly, check if we should stop
-                    if self.client._stop_event.is_set():
+                    if self._stop_event.is_set():
                         return
                 except Exception as e:
                     logger.error(f"Connection attempt failed: {e}")
@@ -296,7 +350,7 @@ class IOTClient:
             asyncio.create_task(self.send_max_cudp(content, recipient))
         elif mode == "PUDP":
             # PUDP: wait for connection
-            while not self.client.is_connected:
+            while not self.is_connected:
                 await asyncio.sleep(1)
             await self.send_max_message(content, recipient, "PUDP")
         elif mode == "PTCP":
@@ -323,7 +377,7 @@ class IOTClient:
                 "total_parts": len(parts)
             }
             try:
-                sent_msg = await self.client.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
+                sent_msg = await self.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
                 if sent_msg:
                     message_ids.append(sent_msg.id)
             except Exception as e:
@@ -357,9 +411,9 @@ class IOTClient:
                 "total_parts": len(parts)
             }
             try:
-                await self.client.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
+                await self.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
             except Exception as e:
-                logger.error(f"Failed to send {mode} message (is_connected={self.client.is_connected}): {e}")
+                logger.error(f"Failed to send {mode} message (is_connected={self.is_connected}): {e}")
 
     async def send_max_ptcp(self, content: str, recipient: str):
         encrypted = self.encrypt_content(content, recipient)
@@ -375,7 +429,7 @@ class IOTClient:
         while True:
             # Check history
             try:
-                if self.client.is_connected:
+                if self.is_connected:
                     history = await self.client.fetch_history(CHAT_ID, backward=50)
                     found = False
                     if history:
@@ -389,7 +443,7 @@ class IOTClient:
                         break
                     
                     logger.info("PTCP: Message not found, sending/resending...")
-                    await self.client.send_message(text=payload_str, chat_id=CHAT_ID)
+                    await self.send_message(text=payload_str, chat_id=CHAT_ID)
             except Exception as e:
                 logger.error(f"PTCP send/check error: {e}")
             
@@ -402,8 +456,8 @@ async def main():
     
     iot = IOTClient(phone, work_dir)
     
-    @iot.client.on_start
-    async def on_start():
+    @iot.client.on_start()
+    async def on_start(client=None):
         if iot.is_first_start or iot.is_new_identity:
             logger.info("First session start or new identity, sending UUID and Public Key.")
             await iot.send_start_message()
