@@ -163,7 +163,7 @@ class IOTClient:
         except Exception as e:
             logger.error(f"Failed to save known_uuids: {e}")
 
-    async def handle_max_message(self, msg: Message):
+    async def handle_max_message(self, msg: Message, client=None, *args, **kwargs):
         try:
             data = json.loads(msg.text)
             if data.get("protocol") != PROTOCOL_NAME:
@@ -457,7 +457,7 @@ async def main():
     iot = IOTClient(phone, work_dir)
     
     @iot.client.on_start()
-    async def on_start(client=None):
+    async def on_start(*args, **kwargs):
         if iot.is_first_start or iot.is_new_identity:
             logger.info("First session start or new identity, sending UUID and Public Key.")
             await iot.send_start_message()
