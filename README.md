@@ -25,7 +25,7 @@
 ### 1. Установка зависимостей
 
 ```bash
-pip install pymax cryptography aiohttp aiofiles
+pip install maxapi-python cryptography aiohttp aiofiles
 ```
 
 ### 2. Конфигурация
