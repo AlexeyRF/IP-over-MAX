@@ -30,7 +30,7 @@ PROTOCOL_VERSION_1 = "IP-over-MAX-v1"
 PROTOCOL_VERSION_2 = "IP-over-MAX-v2"
 
 # Настройки разделения вложений (из zdisk)
-MAX_ATTACH_SIZE = 50 * 1024  # 50 KB для тестирования разделения. Можно увеличить до 10 * 1024 * 1024
+MAX_ATTACH_SIZE = 1024 * 1024 * 1024  # 1 GB
 
 # Локальные порты
 PTCP_PORT = 10001
