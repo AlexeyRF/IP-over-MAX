@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import aiohttp
 import pymax
-from pymax import WebClient, Message, ExtraConfig, File
+from pymax import WebClient, Client, Message, ExtraConfig, File
+from pymax.auth import ConsolePasswordProvider, PasswordProvider
 from pymax.types.domain import FileAttachment
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
@@ -28,6 +29,10 @@ WORK_DIR = "cache"
 USE_V2 = True  # True для использования версии 2 (с вложениями), False для версии 1
 PROTOCOL_VERSION_1 = "IP-over-MAX-v1"
 PROTOCOL_VERSION_2 = "IP-over-MAX-v2"
+
+# Настройки TCP клиента
+USE_TCP = False # True для использования TCP клиента (Client) вместо WebClient
+TWO_FA_PASSWORD = None # Пароль 2FA, если нужен
 
 # Настройки разделения вложений (из zdisk)
 MAX_ATTACH_SIZE = 1024 * 1024 * 1024  # 1 GB
@@ -467,11 +472,38 @@ class IOTClient:
             self.is_first_start = True
             logger.info("Файл session.db не найден, предполагаем первый запуск.")
 
-        self.client = WebClient(
-            session_name="session.db",
-            work_dir=work_dir,
-            extra_config=ExtraConfig(reconnect=False)
-        )
+        # Автопроверка телефона
+        dummy_phones = {"+12345678900", "+1234567890", "+00000000000", ""}
+        if PHONE.strip() in dummy_phones:
+            effective_use_tcp = False
+            logger.info("Обнаружен фиктивный номер телефона, используется WebClient (QR).")
+        else:
+            effective_use_tcp = True
+            logger.info("Обнаружен реальный номер телефона, используется TCP клиент.")
+
+        if effective_use_tcp:
+            class StaticPasswordProvider(PasswordProvider):
+                def __init__(self, password):
+                    self.password = password
+                async def get_password(self, hint=None) -> str:
+                    if self.password:
+                        return self.password
+                    provider = ConsolePasswordProvider()
+                    return await provider.get_password(hint)
+            
+            self.client = Client(
+                phone=PHONE,
+                session_name="session.db",
+                work_dir=work_dir,
+                extra_config=ExtraConfig(reconnect=False),
+                password_provider=StaticPasswordProvider(TWO_FA_PASSWORD) if TWO_FA_PASSWORD else ConsolePasswordProvider()
+            )
+        else:
+            self.client = WebClient(
+                session_name="session.db",
+                work_dir=work_dir,
+                extra_config=ExtraConfig(reconnect=False)
+            )
 
         if self._load_identity():
             logger.info(f"Загружен существующий идентификатор (UUID): {self.my_uuid}")
