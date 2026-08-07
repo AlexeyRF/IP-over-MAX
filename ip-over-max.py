@@ -21,17 +21,19 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
 
 # Настройка
-PHONE = "+1234567890"  # Используем произвольный, потому что для QR не нужен телефон
+PHONE = "+1234567890"  # Нужен если TCP, для QR не нужен телефон
 CHAT_ID = 0
 WORK_DIR = "cache"
 
 # Выбор версии протокола
-USE_V2 = True  # True для использования версии 2 (с вложениями), False для версии 1
+PROTOCOL_VERSION = 3  # 1, 2, или 3
 PROTOCOL_VERSION_1 = "IP-over-MAX-v1"
 PROTOCOL_VERSION_2 = "IP-over-MAX-v2"
+PROTOCOL_VERSION_3 = "IP-over-MAX-v3"
+COMMON_KEY = None  # Строка, например "my_secret_key", для шифрования метаданных и всего трафика
 
 # Настройки TCP клиента
-USE_TCP = False # True для использования TCP клиента (Client) вместо WebClient
+USE_TCP = True # True для использования TCP клиента (Client) вместо WebClient
 TWO_FA_PASSWORD = None # Пароль 2FA, если нужен
 
 # Настройки разделения вложений (из zdisk)
@@ -49,58 +51,59 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("IOTClient")
 print(pymax.__version__)
 
-# Патчим (monkeypatch) LoginResponse и AuthService в pymax, чтобы сделать поле 'token' необязательным
-# и автоматически переносить текущий токен сессии, если в ответе сервера он отсутствует.
-try:
-    from pymax.types.domain.login import LoginResponse
-    from pymax.api.auth.service import AuthService
-    from pymax.types.domain.element import ElementAttributes
-    from typing import Optional
 
-    token_field = LoginResponse.model_fields.get("token")
-    if token_field:
-        token_field.default = None
-        token_field.annotation = Optional[str]
-        LoginResponse.__annotations__["token"] = Optional[str]
-        LoginResponse.model_rebuild(force=True)
 
-    url_field = ElementAttributes.model_fields.get("url")
-    if url_field:
-        url_field.default = None
-        url_field.annotation = Optional[str]
-        ElementAttributes.__annotations__["url"] = Optional[str]
-        ElementAttributes.model_rebuild(force=True)
+_fernet_instance = None
+def get_fernet_instance():
+    global _fernet_instance
+    if _fernet_instance is None and COMMON_KEY:
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.backends import default_backend
+        import base64
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"ip-over-max-v3-salt",
+            iterations=100000,
+            backend=default_backend()
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(COMMON_KEY.encode('utf-8')))
+        _fernet_instance = Fernet(key)
+    return _fernet_instance
 
-    try:
-        from pymax.formatting.markdown import ElementAttributes as ElementAttributesMD
-        url_field_md = ElementAttributesMD.model_fields.get("url")
-        if url_field_md:
-            url_field_md.default = None
-            url_field_md.annotation = Optional[str]
-            ElementAttributesMD.__annotations__["url"] = Optional[str]
-            ElementAttributesMD.model_rebuild(force=True)
-    except Exception:
-        pass
+def pack_payload(payload: dict, use_v3: bool) -> str:
+    import json
+    import zlib
+    import base64
+    if not use_v3:
+        return json.dumps(payload)
+    data = json.dumps(payload).encode('utf-8')
+    compressed = zlib.compress(data, level=6)
+    if COMMON_KEY:
+        f = get_fernet_instance()
+        encrypted = f.encrypt(compressed)
+        return "z3e:" + base64.b64encode(encrypted).decode('utf-8')
+    else:
+        return "z3c:" + base64.b64encode(compressed).decode('utf-8')
 
-    # Rebuild dependent models in bottom-up order
-    from pymax.types.domain.element import Element
-    from pymax.types.domain.message import Message
-    from pymax.types.domain.chat import Chat
-    
-    Element.model_rebuild(force=True)
-    Message.model_rebuild(force=True)
-    Chat.model_rebuild(force=True)
-    LoginResponse.model_rebuild(force=True)
-
-    original_login = AuthService.login
-    async def patched_login(self, *args, **kwargs):
-        response = await original_login(self, *args, **kwargs)
-        if response and response.token is None and self.app.session is not None:
-            response.token = self.app.session.token
-        return response
-    AuthService.login = patched_login
-except Exception as e:
-    logger.warning(f"Не удалось применить патч к авторизации pymax: {e}")
+def unpack_payload(text: str) -> dict:
+    import json
+    import zlib
+    import base64
+    if text.startswith("z3e:"):
+        if not COMMON_KEY:
+            raise ValueError("Получено зашифрованное v3 сообщение, но COMMON_KEY не задан")
+        f = get_fernet_instance()
+        encrypted = base64.b64decode(text[4:])
+        compressed = f.decrypt(encrypted)
+        return json.loads(zlib.decompress(compressed))
+    elif text.startswith("z3c:"):
+        compressed = base64.b64decode(text[4:])
+        return json.loads(zlib.decompress(compressed))
+    else:
+        return json.loads(text)
 
 class ZDiskCrypto:
     """Handles AES-256-GCM encryption/decryption with PBKDF2 key derivation."""
@@ -169,28 +172,25 @@ class ZDiskCrypto:
             return False
 
 class FileSplitter:
-    """Класс для разделения файла на части со сжатием"""
+    """Класс для разделения файла на части без сжатия (сжатие вынесено отдельно)"""
     
-    def __init__(self, chunk_size: int = 10 * 1024 * 1024, compress_level: int = 6):
+    def __init__(self, chunk_size: int = 1024 * 1024 * 1024):
         self.chunk_size = chunk_size
-        self.compress_level = compress_level
     
     def calculate_crc32(self, file_path: str) -> str:
+        import zlib
         crc = 0
         with open(file_path, 'rb') as f:
             while chunk := f.read(8192):
                 crc = zlib.crc32(chunk, crc)
         return format(crc & 0xFFFFFFFF, '08x')
     
-    def compress_data(self, data: bytes) -> bytes:
-        return zlib.compress(data, level=self.compress_level)
-    
     def split_file(self, input_file: str, output_dir: Optional[str] = None) -> Dict:
+        import zlib
         input_path = Path(input_file)
-        if not input_path.exists():
-            raise FileNotFoundError(f"Файл не найден: {input_file}")
-        if not input_path.is_file():
-            raise IsADirectoryError(f"Путь указывает на директорию: {input_file}")
+        if not input_path.exists() or not input_path.is_file():
+            raise FileNotFoundError(f"Файл не найден или это директория: {input_file}")
+            
         if output_dir is None:
             output_dir = input_path.parent
         else:
@@ -207,41 +207,31 @@ class FileSplitter:
         parts_info = []
         part_number = 1
 
-        compressor = zlib.compressobj(level=self.compress_level)
-        compressed_size = 0
-        current_part_data = bytearray()
-
         with open(input_file, 'rb') as f:
             while True:
-                chunk = f.read(1024 * 1024)
+                chunk = f.read(self.chunk_size)
                 if not chunk:
                     break
-                compressed_chunk = compressor.compress(chunk)
-                current_part_data.extend(compressed_chunk)
-                while len(current_part_data) >= self.chunk_size:
-                    to_write = current_part_data[:self.chunk_size]
-                    current_part_data = current_part_data[self.chunk_size:]
-                    self._write_part(parts_dir, base_name, part_number, to_write, parts_info)
-                    compressed_size += len(to_write)
-                    part_number += 1
-
-            remaining = compressor.flush()
-            current_part_data.extend(remaining)
-            while len(current_part_data) > 0:
-                to_write = current_part_data[:self.chunk_size]
-                current_part_data = current_part_data[self.chunk_size:]
-                self._write_part(parts_dir, base_name, part_number, to_write, parts_info)
-                compressed_size += len(to_write)
+                part_filename = f"{base_name}.part{part_number:04d}"
+                part_path = parts_dir / part_filename
+                part_crc = format(zlib.crc32(chunk) & 0xFFFFFFFF, '08x')
+                with open(part_path, 'wb') as part_file:
+                    part_file.write(chunk)
+                    
+                parts_info.append({
+                    'part_number': part_number,
+                    'filename': part_filename,
+                    'size': len(chunk),
+                    'crc32': part_crc
+                })
                 part_number += 1
 
         total_parts = part_number - 1
         manifest = {
             'original_file': input_path.name,
             'original_size': original_size,
-            'compressed_size': compressed_size,
             'total_parts': total_parts,
             'chunk_size': self.chunk_size,
-            'compress_level': self.compress_level,
             'original_crc32': original_crc,
             'parts': parts_info
         }
@@ -256,25 +246,10 @@ class FileSplitter:
             'manifest_file': str(manifest_path),
             'total_parts': total_parts,
             'original_size': original_size,
-            'compressed_size': compressed_size,
-            'compression_ratio': original_size / compressed_size if compressed_size > 0 else 1,
             'original_crc32': original_crc
         }
 
-    def _write_part(self, parts_dir, base_name, part_number, data, parts_info):
-        part_filename = f"{base_name}.part{part_number:04d}"
-        part_path = parts_dir / part_filename
-        part_crc = format(zlib.crc32(data) & 0xFFFFFFFF, '08x')
-        with open(part_path, 'wb') as part_file:
-            part_file.write(data)
-        parts_info.append({
-            'part_number': part_number,
-            'filename': part_filename,
-            'size': len(data),
-            'crc32': part_crc
-        })
 
-class FileAssembler:
     """Класс для сборки файла из частей с распаковкой"""
     
     def __init__(self):
@@ -386,7 +361,7 @@ class ZDiskFiles:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.splitter = FileSplitter()
         self.assembler = FileAssembler()
-        self._max_part_size = 10 * 1024 * 1024
+        self._max_part_size = 1024 * 1024 * 1024
 
     @property
     def MAX_PART_SIZE(self):
@@ -443,10 +418,15 @@ def filter_chat(chat_id: int):
     return lambda message: message.chat_id == chat_id
 
 class IOTClient:
-    def __init__(self, phone: str, work_dir: str, use_v2: bool = USE_V2):
-        self.use_v2 = use_v2
-        self.protocol_name = PROTOCOL_VERSION_2 if self.use_v2 else PROTOCOL_VERSION_1
-        logger.info(f"Используется протокол: {self.protocol_name} (use_v2={self.use_v2})")
+    def __init__(self, phone: str, work_dir: str, protocol_version: int = PROTOCOL_VERSION):
+        self.protocol_version = protocol_version
+        if self.protocol_version >= 3:
+            self.protocol_name = PROTOCOL_VERSION_3
+        elif self.protocol_version >= 2:
+            self.protocol_name = PROTOCOL_VERSION_2
+        else:
+            self.protocol_name = PROTOCOL_VERSION_1
+        logger.info(f"Используется протокол: {self.protocol_name} (version={self.protocol_version})")
         
         self._work_dir = Path(work_dir)
         self._work_dir.mkdir(parents=True, exist_ok=True)
@@ -582,7 +562,7 @@ class IOTClient:
         except Exception as e:
             logger.error(f"Не удалось сохранить известные UUID: {e}")
 
-    async def check_and_assemble(self, file_hash: str, recipient: str, file_aes_password_enc: Optional[str] = None, is_compressed: bool = False):
+    async def check_and_assemble(self, file_hash: str, recipient: str, file_aes_password_enc: Optional[str] = None, is_compressed: bool = False, msg_data: Optional[Dict] = None):
         temp_hash_dir = Path(self.zdisk_files.temp_dir) / f"parts_{file_hash}"
         parts_dir = temp_hash_dir / "parts"
         
@@ -635,11 +615,7 @@ class IOTClient:
             if is_compressed:
                 logger.info(f"Распаковка данных для хэша {file_hash}...")
                 decompressed_path = temp_hash_dir / f"payload_{file_hash}.final"
-                with open(work_path, 'rb') as f_in, open(decompressed_path, 'wb') as f_out:
-                    decompressor = zlib.decompressobj()
-                    while chunk := f_in.read(1024 * 1024):
-                        f_out.write(decompressor.decompress(chunk))
-                    f_out.write(decompressor.flush())
+                self.decompress_file(str(work_path), str(decompressed_path))
                 work_path = decompressed_path
 
             # Попробуем определить, текст это или файл
@@ -649,7 +625,13 @@ class IOTClient:
                 final_output_path = self._work_dir / original_filename
                 shutil.copy2(work_path, final_output_path)
                 logger.info(f"Файл получен, расшифрован и распакован: {final_output_path}")
-                await self.send_to_local_port(f"Файл получен: {final_output_path}")
+                content = f"Файл получен: {final_output_path}"
+                if msg_data and msg_data.get("content"):
+                    text_content = msg_data.get("content")
+                    if text_content and recipient != "broadcast":
+                        text_content = self.decrypt_content(text_content)
+                    content = content + "\nТекст: " + text_content
+                await self.send_to_local_port(content)
             else:
                 # Это текстовый payload
                 with open(work_path, 'rb') as res_f:
@@ -662,6 +644,25 @@ class IOTClient:
             self.zdisk_files.cleanup(str(temp_hash_dir))
         except Exception as e:
             logger.error(f"Ошибка при сборке/обработке файла {file_hash}: {e}")
+
+
+    async def download_file_to_disk(self, url: str, dest_path: Path):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    with open(dest_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            f.write(chunk)
+                else:
+                    raise RuntimeError(f"Не удалось скачать файл, статус: {response.status}")
+
+    def decompress_file(self, input_path: str, output_path: str):
+        import zlib
+        with open(input_path, 'rb') as f_in, open(output_path, 'wb') as f_out:
+            decompressor = zlib.decompressobj()
+            while chunk := f_in.read(1024 * 1024):
+                f_out.write(decompressor.decompress(chunk))
+            f_out.write(decompressor.flush())
 
     async def download_file(self, url: str) -> bytes:
         async with aiohttp.ClientSession() as session:
@@ -680,7 +681,11 @@ class IOTClient:
             if msg_time > 0 and msg_time < self._boot_time:
                 return
 
-            data = json.loads(msg.text)
+            try:
+                data = unpack_payload(msg.text)
+            except Exception as e:
+                logger.debug(f"Игнорируем нечитаемое сообщение: {e}")
+                return
             protocol = data.get("protocol")
             msg_type = data.get("type")
             recipient = data.get("recipient")
@@ -690,7 +695,11 @@ class IOTClient:
             is_compressed = data.get("is_compressed", False)
             
             # Проверяем версию протокола
-            if self.use_v2:
+            if (self.protocol_version >= 3):
+                if protocol not in [PROTOCOL_VERSION_1, PROTOCOL_VERSION_2, PROTOCOL_VERSION_3]:
+                    logger.warning(f"Неизвестная версия протокола: {protocol}")
+                    return
+            elif (self.protocol_version >= 2):
                 if protocol not in [PROTOCOL_VERSION_1, PROTOCOL_VERSION_2]:
                     logger.warning(f"Неизвестная версия протокола: {protocol}")
                     return
@@ -700,7 +709,7 @@ class IOTClient:
                     return
             
             # Обработка сообщений протокола V2 с разделением через вложения
-            if self.use_v2 and msg_type == "content_manifest":
+            if (self.protocol_version >= 2) and msg_type == "content_manifest":
                 manifest_filename = data.get("manifest_filename")
                 manifest_attach = None
                 for attach in msg.attaches or []:
@@ -727,14 +736,14 @@ class IOTClient:
                                 m_f.write(manifest_bytes)
                                 
                             logger.info(f"Манифест {manifest_filename} сохранен. Проверяем сборку...")
-                            await self.check_and_assemble(file_hash, recipient, file_aes_password_enc, is_compressed)
+                            await self.check_and_assemble(file_hash, recipient, file_aes_password_enc, is_compressed, data)
                     except Exception as ex:
                         logger.error(f"Не удалось обработать манифест: {ex}")
                 else:
                     logger.error("Манифест не найден во вложениях сообщения!")
                 return
                 
-            elif self.use_v2 and msg_type == "content_part" and data.get("part_filename"):
+            elif (self.protocol_version >= 2) and msg_type == "content_part" and data.get("part_filename"):
                 # Часть разделенного файла в V2
                 part_filename = data.get("part_filename")
                 part_attach = None
@@ -761,7 +770,7 @@ class IOTClient:
                                 p_f.write(part_bytes)
                                 
                             logger.info(f"Часть {part_filename} сохранена. Проверяем сборку...")
-                            await self.check_and_assemble(file_hash, recipient, file_aes_password_enc, is_compressed)
+                            await self.check_and_assemble(file_hash, recipient, file_aes_password_enc, is_compressed, data)
                     except Exception as ex:
                         logger.error(f"Не удалось обработать часть вложения: {ex}")
                 else:
@@ -780,41 +789,43 @@ class IOTClient:
                                 attach.file_id
                             )
                             if file_req and file_req.url:
-                                file_bytes = await self.download_file(file_req.url)
                                 original_filename = data.get("original_filename")
+                                temp_enc_path = Path(self.zdisk_files.temp_dir) / f"temp_{file_hash}.aes"
+                                await self.download_file_to_disk(file_req.url, temp_enc_path)
+                                work_path = temp_enc_path
                                 
                                 if file_aes_password_enc:
-                                    # Это зашифрованные данные
                                     aes_password = self.decrypt_content(file_aes_password_enc)
-                                    temp_enc_path = Path(self.zdisk_files.temp_dir) / f"temp_{file_hash}.aes"
-                                    with open(temp_enc_path, 'wb') as f:
-                                        f.write(file_bytes)
-                                    
                                     temp_dec_path = Path(self.zdisk_files.temp_dir) / f"temp_{file_hash}.dec"
-                                    success = self.zdisk_crypto.decrypt_file(str(temp_enc_path), str(temp_dec_path), aes_password)
-                                    temp_enc_path.unlink(missing_ok=True)
-                                    
-                                    if success:
-                                        with open(temp_dec_path, 'rb') as f:
-                                            file_bytes = f.read()
-                                        temp_dec_path.unlink(missing_ok=True)
-                                    else:
+                                    success = self.zdisk_crypto.decrypt_file(str(work_path), str(temp_dec_path), aes_password)
+                                    if not success:
                                         raise RuntimeError("Не удалось расшифровать файл")
+                                    work_path.unlink(missing_ok=True)
+                                    work_path = temp_dec_path
                                 
                                 if is_compressed:
-                                    file_bytes = zlib.decompress(file_bytes)
+                                    decompressed_path = Path(self.zdisk_files.temp_dir) / f"temp_{file_hash}.final"
+                                    self.decompress_file(str(work_path), str(decompressed_path))
+                                    work_path.unlink(missing_ok=True)
+                                    work_path = decompressed_path
                                 
                                 if original_filename:
-                                    # Это реальный файл
                                     output_path = self._work_dir / original_filename
-                                    with open(output_path, 'wb') as f:
-                                        f.write(file_bytes)
+                                    shutil.copy2(work_path, output_path)
                                     logger.info(f"Сохранен полученный файл: {output_path}")
+                                    text_content = data.get("content")
+                                    if text_content and recipient != "broadcast":
+                                        text_content = self.decrypt_content(text_content)
+                                    
                                     content = f"Файл сохранен: {output_path}"
+                                    if text_content:
+                                        content = content + "\nТекст: " + text_content
                                 else:
-                                    # Это текстовый payload
-                                    content = file_bytes.decode('utf-8', errors='ignore')
+                                    with open(work_path, 'rb') as res_f:
+                                        content = res_f.read().decode('utf-8', errors='ignore')
                                     logger.info(f"Содержимое вложения успешно скачано и обработано")
+                                
+                                work_path.unlink(missing_ok=True)
                                 break
                         except Exception as ex:
                             logger.error(f"Не удалось скачать/разобрать вложение: {ex}")
@@ -877,8 +888,10 @@ class IOTClient:
         file_aes_password_enc = None
         cleanup_payload = False
         
+        msg_content = None
         # 1. Сначала всегда сжимаем исходные данные
         if file_path:
+            msg_content = encrypted_payload  # Передаем текст в payload, так как отправляем файл
             raw_file_path = Path(file_path)
             compressed_file_path = temp_dir / f"{raw_file_path.name}.z"
             with open(raw_file_path, 'rb') as f_in, open(compressed_file_path, 'wb') as f_out:
@@ -946,12 +959,13 @@ class IOTClient:
                     "file_hash": payload_hash,
                     "manifest_filename": os.path.basename(manifest_file),
                     "file_aes_password_enc": file_aes_password_enc,
+                    "content": msg_content,
                     "stable_id": stable_id,
                     "timestamp": timestamp
                 }
                 
                 manifest_msg = await self.send_message(
-                    text=json.dumps(msg_payload),
+                    text=pack_payload(msg_payload, (self.protocol_version >= 3)),
                     chat_id=CHAT_ID,
                     attachments=[File(path=manifest_stripped)]
                 )
@@ -1013,13 +1027,14 @@ class IOTClient:
                     "file_hash": payload_hash,
                     "original_filename": payload_filename if file_path else None,
                     "file_aes_password_enc": file_aes_password_enc,
+                    "content": msg_content,
                     "stable_id": stable_id,
                     "timestamp": timestamp
                 }
                 file_attach = File(path=str(payload_file_path))
                 
                 sent_msg = await self.send_message(
-                    text=json.dumps(msg_payload),
+                    text=pack_payload(msg_payload, (self.protocol_version >= 3)),
                     chat_id=CHAT_ID,
                     attachments=[file_attach]
                 )
@@ -1062,7 +1077,7 @@ class IOTClient:
             "recipient": "broadcast",
             "pub_key": self.pub_key_pem
         }
-        await self.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
+        await self.send_message(text=pack_payload(msg, (self.protocol_version >= 3)), chat_id=CHAT_ID)
 
     async def request_repeat_start(self, target_uuid_b64: str):
         msg = {
@@ -1071,7 +1086,7 @@ class IOTClient:
             "author": self.my_uuid_b64,
             "recipient": target_uuid_b64
         }
-        await self.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
+        await self.send_message(text=pack_payload(msg, (self.protocol_version >= 3)), chat_id=CHAT_ID)
 
     async def send_to_local_port(self, content: str):
         try:
@@ -1180,7 +1195,7 @@ class IOTClient:
         message_ids = []
         
         # Если включена v2 и (зашифрованный payload большой ИЛИ есть файл), отправляем как тех.информацию + вложение (с разделением)
-        if self.use_v2 and (len(encrypted) > 3000 or file_path):
+        if (self.protocol_version >= 2) and (len(encrypted) > 3000 or file_path):
             try:
                 sent_msg = await self.send_v2_large_payload(encrypted, recipient, "CUDP", file_path, timestamp=timestamp)
                 if sent_msg:
@@ -1204,7 +1219,7 @@ class IOTClient:
                     "timestamp": timestamp
                 }
                 try:
-                    sent_msg = await self.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
+                    sent_msg = await self.send_message(text=pack_payload(msg, (self.protocol_version >= 3)), chat_id=CHAT_ID)
                     if sent_msg:
                         message_ids.append(sent_msg.id)
                 except Exception as e:
@@ -1223,7 +1238,7 @@ class IOTClient:
         encrypted = self.encrypt_content(content, recipient) if content else ""
         
         # Если включена v2 и (зашифрованный payload большой ИЛИ есть файл), отправляем как тех.информацию + вложение (с разделением)
-        if self.use_v2 and (len(encrypted) > 3000 or file_path):
+        if (self.protocol_version >= 2) and (len(encrypted) > 3000 or file_path):
             try:
                 await self.send_v2_large_payload(encrypted, recipient, mode, file_path, timestamp=timestamp)
             except Exception as e:
@@ -1245,7 +1260,7 @@ class IOTClient:
                     "timestamp": timestamp
                 }
                 try:
-                    await self.send_message(text=json.dumps(msg), chat_id=CHAT_ID)
+                    await self.send_message(text=pack_payload(msg, (self.protocol_version >= 3)), chat_id=CHAT_ID)
                 except Exception as e:
                     logger.error(f"Не удалось отправить сообщение {mode} (подключение={self.is_connected}): {e}")
 
@@ -1253,7 +1268,7 @@ class IOTClient:
         encrypted = self.encrypt_content(content, recipient) if content else ""
         
         # Если включена v2 и (зашифрованный payload большой ИЛИ есть файл), отправляем через систему вложений
-        if self.use_v2 and (len(encrypted) > 3000 or file_path):
+        if (self.protocol_version >= 2) and (len(encrypted) > 3000 or file_path):
             import hashlib
             
             # Уникальный стабильный ID для этого конкретного запроса на отправку.
@@ -1304,8 +1319,9 @@ class IOTClient:
                         history = await self.client.fetch_history(CHAT_ID, backward=50)
                         found = False
                         if history:
+                            packed_str = pack_payload(msg_payload, (self.protocol_version >= 3))
                             for m in history:
-                                if m.text == payload_str:
+                                if m.text == packed_str:
                                     found = True
                                     break
                         
@@ -1314,7 +1330,7 @@ class IOTClient:
                             break
                         
                         logger.info("PTCP: Сообщение не найдено, отправка/повторная отправка...")
-                        await self.send_message(text=payload_str, chat_id=CHAT_ID)
+                        await self.send_message(text=pack_payload(msg_payload, (self.protocol_version >= 3)), chat_id=CHAT_ID)
                 except Exception as e:
                     logger.error(f"Ошибка проверки/отправки PTCP: {e}")
                 
@@ -1326,7 +1342,7 @@ async def main():
     work_dir = "cache"
     
     # Передаем USE_V2 из глобальной конфигурации
-    iot = IOTClient(phone, work_dir, use_v2=USE_V2)
+    iot = IOTClient(phone, work_dir, protocol_version=PROTOCOL_VERSION)
     
     @iot.client.on_start()
     async def on_start(*args, **kwargs):
