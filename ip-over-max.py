@@ -73,37 +73,6 @@ def get_fernet_instance():
         _fernet_instance = Fernet(key)
     return _fernet_instance
 
-def pack_payload(payload: dict, use_v3: bool) -> str:
-    import json
-    import zlib
-    import base64
-    if not use_v3:
-        return json.dumps(payload)
-    data = json.dumps(payload).encode('utf-8')
-    compressed = zlib.compress(data, level=6)
-    if COMMON_KEY:
-        f = get_fernet_instance()
-        encrypted = f.encrypt(compressed)
-        return "z3e:" + base64.b64encode(encrypted).decode('utf-8')
-    else:
-        return "z3c:" + base64.b64encode(compressed).decode('utf-8')
-
-def unpack_payload(text: str) -> dict:
-    import json
-    import zlib
-    import base64
-    if text.startswith("z3e:"):
-        if not COMMON_KEY:
-            raise ValueError("Получено зашифрованное v3 сообщение, но COMMON_KEY не задан")
-        f = get_fernet_instance()
-        encrypted = base64.b64decode(text[4:])
-        compressed = f.decrypt(encrypted)
-        return json.loads(zlib.decompress(compressed))
-    elif text.startswith("z3c:"):
-        compressed = base64.b64decode(text[4:])
-        return json.loads(zlib.decompress(compressed))
-    else:
-        return json.loads(text)
 
 class ZDiskCrypto:
     """Handles AES-256-GCM encryption/decryption with PBKDF2 key derivation."""
@@ -418,6 +387,95 @@ def filter_chat(chat_id: int):
     return lambda message: message.chat_id == chat_id
 
 class IOTClient:
+
+    def pack_payload(self, payload: dict) -> str:
+        import json
+        import zlib
+        import base64
+        import secrets
+        import string
+        if not (self.protocol_version >= 3):
+            return json.dumps(payload)
+            
+        data = json.dumps(payload).encode('utf-8')
+        compressed = zlib.compress(data, level=6)
+        
+        recipient = payload.get("recipient")
+        if recipient and recipient != "broadcast":
+            alphabet = string.ascii_letters + string.digits
+            aes_password = ''.join(secrets.choice(alphabet) for _ in range(16))
+            enc_password_b64 = self.encrypt_content(aes_password, recipient)
+            if enc_password_b64:
+                from cryptography.fernet import Fernet
+                from cryptography.hazmat.primitives import hashes
+                from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+                from cryptography.hazmat.backends import default_backend
+                
+                kdf = PBKDF2HMAC(
+                    algorithm=hashes.SHA256(),
+                    length=32,
+                    salt=b"ip-over-max-v3-salt",
+                    iterations=100000,
+                    backend=default_backend()
+                )
+                key = base64.urlsafe_b64encode(kdf.derive(aes_password.encode('utf-8')))
+                f = Fernet(key)
+                encrypted = f.encrypt(compressed)
+                return f"z3r:{enc_password_b64}:{base64.b64encode(encrypted).decode('utf-8')}"
+                
+        if COMMON_KEY:
+            f = get_fernet_instance()
+            encrypted = f.encrypt(compressed)
+            return "z3e:" + base64.b64encode(encrypted).decode('utf-8')
+        else:
+            return "z3c:" + base64.b64encode(compressed).decode('utf-8')
+
+    def unpack_payload(self, text: str) -> dict:
+        import json
+        import zlib
+        import base64
+        if text.startswith("z3r:"):
+            parts = text.split(":", 2)
+            if len(parts) != 3:
+                raise ValueError("Неверный формат z3r сообщения")
+            enc_password_b64 = parts[1]
+            encrypted_data_b64 = parts[2]
+            
+            aes_password = self.decrypt_content(enc_password_b64)
+            if not aes_password or aes_password.startswith("[Ошибка"):
+                raise ValueError("Не удалось расшифровать ключ сообщения")
+                
+            from cryptography.fernet import Fernet
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+            from cryptography.hazmat.backends import default_backend
+            
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b"ip-over-max-v3-salt",
+                iterations=100000,
+                backend=default_backend()
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(aes_password.encode('utf-8')))
+            f = Fernet(key)
+            encrypted = base64.b64decode(encrypted_data_b64)
+            compressed = f.decrypt(encrypted)
+            return json.loads(zlib.decompress(compressed))
+            
+        elif text.startswith("z3e:"):
+            if not COMMON_KEY:
+                raise ValueError("Получено зашифрованное v3 сообщение, но COMMON_KEY не задан")
+            f = get_fernet_instance()
+            encrypted = base64.b64decode(text[4:])
+            compressed = f.decrypt(encrypted)
+            return json.loads(zlib.decompress(compressed))
+        elif text.startswith("z3c:"):
+            compressed = base64.b64decode(text[4:])
+            return json.loads(zlib.decompress(compressed))
+        else:
+            return json.loads(text)
+
     def __init__(self, phone: str, work_dir: str, protocol_version: int = PROTOCOL_VERSION):
         self.protocol_version = protocol_version
         if self.protocol_version >= 3:
@@ -628,7 +686,7 @@ class IOTClient:
                 content = f"Файл получен: {final_output_path}"
                 if msg_data and msg_data.get("content"):
                     text_content = msg_data.get("content")
-                    if text_content and recipient != "broadcast":
+                    if text_content and recipient != "broadcast" and self.protocol_version < 3:
                         text_content = self.decrypt_content(text_content)
                     content = content + "\nТекст: " + text_content
                 await self.send_to_local_port(content)
@@ -682,7 +740,7 @@ class IOTClient:
                 return
 
             try:
-                data = unpack_payload(msg.text)
+                data = self.unpack_payload(msg.text)
             except Exception as e:
                 logger.debug(f"Игнорируем нечитаемое сообщение: {e}")
                 return
@@ -832,7 +890,7 @@ class IOTClient:
                 
                 if content is None:
                     # Если вложений не было, проверяем текстовое поле content (для V1)
-                    if recipient != "broadcast":
+                    if recipient != "broadcast" and self.protocol_version < 3:
                         content = self.decrypt_content(content)
                 
                 if content is None:
@@ -965,7 +1023,7 @@ class IOTClient:
                 }
                 
                 manifest_msg = await self.send_message(
-                    text=pack_payload(msg_payload, (self.protocol_version >= 3)),
+                    text=self.pack_payload(msg_payload),
                     chat_id=CHAT_ID,
                     attachments=[File(path=manifest_stripped)]
                 )
@@ -1034,7 +1092,7 @@ class IOTClient:
                 file_attach = File(path=str(payload_file_path))
                 
                 sent_msg = await self.send_message(
-                    text=pack_payload(msg_payload, (self.protocol_version >= 3)),
+                    text=self.pack_payload(msg_payload),
                     chat_id=CHAT_ID,
                     attachments=[file_attach]
                 )
@@ -1077,7 +1135,7 @@ class IOTClient:
             "recipient": "broadcast",
             "pub_key": self.pub_key_pem
         }
-        await self.send_message(text=pack_payload(msg, (self.protocol_version >= 3)), chat_id=CHAT_ID)
+        await self.send_message(text=self.pack_payload(msg), chat_id=CHAT_ID)
 
     async def request_repeat_start(self, target_uuid_b64: str):
         msg = {
@@ -1086,7 +1144,7 @@ class IOTClient:
             "author": self.my_uuid_b64,
             "recipient": target_uuid_b64
         }
-        await self.send_message(text=pack_payload(msg, (self.protocol_version >= 3)), chat_id=CHAT_ID)
+        await self.send_message(text=self.pack_payload(msg), chat_id=CHAT_ID)
 
     async def send_to_local_port(self, content: str):
         try:
@@ -1191,7 +1249,10 @@ class IOTClient:
             await self.send_max_ptcp(content, recipient, file_path, timestamp)
 
     async def send_max_cudp(self, content: str, recipient: str, file_path: Optional[str] = None, timestamp: Optional[int] = None):
-        encrypted = self.encrypt_content(content, recipient) if content else ""
+        if self.protocol_version >= 3:
+            encrypted = content if content else ""
+        else:
+            encrypted = self.encrypt_content(content, recipient) if content else ""
         message_ids = []
         
         # Если включена v2 и (зашифрованный payload большой ИЛИ есть файл), отправляем как тех.информацию + вложение (с разделением)
@@ -1219,7 +1280,7 @@ class IOTClient:
                     "timestamp": timestamp
                 }
                 try:
-                    sent_msg = await self.send_message(text=pack_payload(msg, (self.protocol_version >= 3)), chat_id=CHAT_ID)
+                    sent_msg = await self.send_message(text=self.pack_payload(msg), chat_id=CHAT_ID)
                     if sent_msg:
                         message_ids.append(sent_msg.id)
                 except Exception as e:
@@ -1235,7 +1296,10 @@ class IOTClient:
                 logger.error(f"Не удалось удалить CUDP сообщения {message_ids}: {e}")
 
     async def send_max_message(self, content: str, recipient: str, mode: str, file_path: Optional[str] = None, timestamp: Optional[int] = None):
-        encrypted = self.encrypt_content(content, recipient) if content else ""
+        if self.protocol_version >= 3:
+            encrypted = content if content else ""
+        else:
+            encrypted = self.encrypt_content(content, recipient) if content else ""
         
         # Если включена v2 и (зашифрованный payload большой ИЛИ есть файл), отправляем как тех.информацию + вложение (с разделением)
         if (self.protocol_version >= 2) and (len(encrypted) > 3000 or file_path):
@@ -1260,12 +1324,15 @@ class IOTClient:
                     "timestamp": timestamp
                 }
                 try:
-                    await self.send_message(text=pack_payload(msg, (self.protocol_version >= 3)), chat_id=CHAT_ID)
+                    await self.send_message(text=self.pack_payload(msg), chat_id=CHAT_ID)
                 except Exception as e:
                     logger.error(f"Не удалось отправить сообщение {mode} (подключение={self.is_connected}): {e}")
 
     async def send_max_ptcp(self, content: str, recipient: str, file_path: Optional[str] = None, timestamp: Optional[int] = None):
-        encrypted = self.encrypt_content(content, recipient) if content else ""
+        if self.protocol_version >= 3:
+            encrypted = content if content else ""
+        else:
+            encrypted = self.encrypt_content(content, recipient) if content else ""
         
         # Если включена v2 и (зашифрованный payload большой ИЛИ есть файл), отправляем через систему вложений
         if (self.protocol_version >= 2) and (len(encrypted) > 3000 or file_path):
@@ -1319,7 +1386,7 @@ class IOTClient:
                         history = await self.client.fetch_history(CHAT_ID, backward=50)
                         found = False
                         if history:
-                            packed_str = pack_payload(msg_payload, (self.protocol_version >= 3))
+                            packed_str = self.pack_payload(msg_payload)
                             for m in history:
                                 if m.text == packed_str:
                                     found = True
@@ -1330,7 +1397,7 @@ class IOTClient:
                             break
                         
                         logger.info("PTCP: Сообщение не найдено, отправка/повторная отправка...")
-                        await self.send_message(text=pack_payload(msg_payload, (self.protocol_version >= 3)), chat_id=CHAT_ID)
+                        await self.send_message(text=self.pack_payload(msg_payload), chat_id=CHAT_ID)
                 except Exception as e:
                     logger.error(f"Ошибка проверки/отправки PTCP: {e}")
                 
